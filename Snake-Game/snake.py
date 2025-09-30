@@ -3,12 +3,17 @@ import serial
 import random
 import sys
 import pygame.gfxdraw  # For anti-aliased drawing
+import re
+import math
 
 # === Configuration ===
 WIDTH, HEIGHT = 800, 600  # Larger window for better visuals
 CELL_SIZE = 20
-FPS = 7  # Further reduced base speed for slower snake
+FPS = 4  # Very slow base speed for snake
 DEAD_ZONE = 150  # Joystick dead zone
+GYRO_DEADZONE = 150  # MPU6050 gyro dead zone
+GYRO_SCALE = 0.0003  # MPU6050 sensitivity
+GYRO_SMOOTHING = 0.9  # MPU6050 smoothing factor
 
 # Colors (Jungle theme)
 BG_COLOR = (10, 50, 20)  # Dark green
@@ -19,12 +24,17 @@ TEXT_COLOR = (230, 230, 230)
 TITLE_COLOR = (0, 200, 255)
 POWERUP_COLOR = (0, 100, 255)  # Blue for power-ups
 
-# Arduino serial port config
-ARDUINO_PORT = 'COM9'
+# Arduino serial port config for Joystick
+JOYSTICK_PORT = 'COM9'
 BAUD_RATE = 9600
 
-# Initialize Pygame, font, and mixer for sounds
+# MPU6050 serial port config
+MPU_PORT = 'COM10'
+BAUD_RATE_MPU = 115200
+
+# Initialize Pygame and mixer explicitly
 pygame.init()
+pygame.mixer.init(frequency=44100, size=-16, channels=2, buffer=512)  # Explicit mixer init
 screen = pygame.display.set_mode((WIDTH, HEIGHT))
 pygame.display.set_caption("Super Noah-Snake-Game")
 clock = pygame.time.Clock()
@@ -32,13 +42,31 @@ font = pygame.font.SysFont('Segoe UI', 28)
 title_font = pygame.font.SysFont('Segoe UI', 36, bold=True)
 small_font = pygame.font.SysFont('Segoe UI', 20)
 
-# Load sounds (download free SFX and place in same folder)
+# Load sounds (place in D:\pygame\Noah-Snake-Game\Snake-Game)
 try:
-    eat_sound = pygame.mixer.Sound('chomp.wav')  # Chomp sound on eat
-    game_over_sound = pygame.mixer.Sound('buzz.wav')  # Buzz on game over
-    powerup_sound = pygame.mixer.Sound('powerup.wav')  # Ding for power-up
+    eat_sound = pygame.mixer.Sound('collect_sound.wav')  # Sound for eating food
+    print("Loaded collect_sound.wav for eat")
 except FileNotFoundError:
-    eat_sound = game_over_sound = powerup_sound = None  # Fallback if no files
+    print("Error: collect_sound.wav not found for eat")
+    eat_sound = None
+try:
+    game_over_sound = pygame.mixer.Sound('collision_sound.wav')  # Sound for game over
+    print("Loaded collision_sound.wav for game over")
+except FileNotFoundError:
+    print("Error: collision_sound.wav not found for game over")
+    game_over_sound = None
+try:
+    powerup_sound = pygame.mixer.Sound('collect_sound.wav')  # Sound for power-up
+    print("Loaded collect_sound.wav for power-up")
+except FileNotFoundError:
+    print("Error: collect_sound.wav not found for power-up")
+    powerup_sound = None
+try:
+    levelup_sound = pygame.mixer.Sound('collision_sound.wav')  # Sound for level-up
+    print("Loaded collision_sound.wav for level-up")
+except FileNotFoundError:
+    print("Error: collision_sound.wav not found for level-up")
+    levelup_sound = None
 
 # Optional background image (create/download 'jungle_bg.png')
 try:
@@ -47,12 +75,19 @@ try:
 except FileNotFoundError:
     background_image = None
 
-# Initialize Serial
+# Initialize Joystick Serial
 try:
-    ser = serial.Serial(ARDUINO_PORT, BAUD_RATE, timeout=0.1)
+    ser_joystick = serial.Serial(JOYSTICK_PORT, BAUD_RATE, timeout=0.1)
 except serial.SerialException:
-    print(f"Error: Cannot connect to Arduino on {ARDUINO_PORT}. Falling back to keyboard controls.")
-    ser = None  # Fallback to keyboard if no serial
+    print(f"Error: Cannot connect to Joystick on {JOYSTICK_PORT}. Falling back to keyboard controls.")
+    ser_joystick = None  # Fallback to keyboard if no serial
+
+# Initialize MPU6050 Serial
+try:
+    ser_mpu = serial.Serial(MPU_PORT, BAUD_RATE_MPU, timeout=0.1)
+except serial.SerialException:
+    print(f"Error: Cannot connect to MPU6050 on {MPU_PORT}. MPU control disabled.")
+    ser_mpu = None
 
 # High score file
 HIGH_SCORE_FILE = 'highscore.txt'
@@ -110,52 +145,98 @@ particles = []  # For eat effects
 # Joystick calibration (assume center is 512; adjust if needed)
 joy_center_x, joy_center_y = 512, 512
 
+# MPU6050 smoothed values
+gX_smooth = 0
+gY_smooth = 0
+gZ_smooth = 0
+
+# MPU6050 regex pattern
+gyro_pattern = re.compile(r'gX\s*=\s*(-?\d+)\s*\|\s*gY\s*=\s*(-?\d+)\s*\|\s*gZ\s*=\s*(-?\d+)')
+
+# Control mode: 0 = Joystick/Keyboard, 1 = MPU6050
+control_mode = 0
+
 def get_direction():
-    global direction, paused
-    if ser:  # Joystick mode
-        try:
-            data = ser.readline().decode().strip()
-            if data:  # Ensure data is not empty
-                values = data.split(',')
-                if len(values) == 3:  # Expect X,Y,B
-                    joyX = int(values[0]) - joy_center_x
-                    joyY = int(values[1]) - joy_center_y
-                    button = int(values[2])
-                    print(f"Joystick: X={joyX}, Y={joyY}, Button={button}")  # Debug print
+    global direction, paused, gX_smooth, gY_smooth, gZ_smooth
+    dx, dy = 0, 0
 
-                    if button == 0:  # Button pressed (LOW due to pull-up)
-                        paused = not paused
+    if control_mode == 0:  # Joystick/Keyboard mode
+        if ser_joystick:  # Joystick mode
+            try:
+                data = ser_joystick.readline().decode().strip()
+                if data:  # Ensure data is not empty
+                    values = data.split(',')
+                    if len(values) == 3:  # Expect X,Y,B
+                        joyX = int(values[0]) - joy_center_x
+                        joyY = int(values[1]) - joy_center_y
+                        button = int(values[2])
 
-                    dx, dy = 0, 0
-                    if abs(joyX) > DEAD_ZONE:
-                        dx = 1 if joyX > 0 else -1
-                    if abs(joyY) > DEAD_ZONE:
-                        dy = 1 if joyY > 0 else -1
+                        if button == 0:  # Button pressed (LOW due to pull-up)
+                            paused = not paused
 
-                    # No diagonals
-                    if dx != 0:
-                        dy = 0
+                        if abs(joyX) > DEAD_ZONE:
+                            dx = 1 if joyX > 0 else -1
+                        if abs(joyY) > DEAD_ZONE:
+                            dy = 1 if joyY > 0 else -1
 
-                    return (dx, dy)
-                else:
-                    print(f"Invalid serial data: {data}")  # Debug
-        except (ValueError, UnicodeDecodeError) as e:
-            print(f"Serial error: {e}")  # Debug
-        return direction  # Fallback to current direction
-    else:  # Keyboard fallback
-        keys = pygame.key.get_pressed()
-        dx, dy = direction
-        if keys[pygame.K_LEFT]:
-            dx, dy = -1, 0
-        elif keys[pygame.K_RIGHT]:
-            dx, dy = 1, 0
-        elif keys[pygame.K_UP]:
-            dx, dy = 0, -1
-        elif keys[pygame.K_DOWN]:
-            dx, dy = 0, 1
-        if keys[pygame.K_p]:
-            paused = not paused
-        return (dx, dy)
+                        # No diagonals
+                        if dx != 0:
+                            dy = 0
+
+                        return (dx, dy)
+            except (ValueError, UnicodeDecodeError) as e:
+                print(f"Joystick serial error: {e}")
+            return direction  # Fallback to current direction
+        else:  # Keyboard fallback
+            keys = pygame.key.get_pressed()
+            if keys[pygame.K_LEFT]:
+                dx, dy = -1, 0
+            elif keys[pygame.K_RIGHT]:
+                dx, dy = 1, 0
+            elif keys[pygame.K_UP]:
+                dx, dy = 0, -1
+            elif keys[pygame.K_DOWN]:
+                dx, dy = 0, 1
+            if keys[pygame.K_p]:
+                paused = not paused
+            return (dx, dy)
+
+    elif control_mode == 1:  # MPU6050 mode
+        if ser_mpu:
+            try:
+                data = ser_mpu.readline().decode(errors='ignore').strip()
+                if data.startswith("aX"):  # Line with motion data
+                    match = gyro_pattern.search(data)
+                    if match:
+                        gX = int(match.group(1))
+                        gY = int(match.group(2))
+                        gZ = int(match.group(3))
+
+                        # Apply deadzone
+                        if abs(gX) < GYRO_DEADZONE: gX = 0
+                        if abs(gY) < GYRO_DEADZONE: gY = 0
+                        if abs(gZ) < GYRO_DEADZONE: gZ = 0
+
+                        # Smooth values
+                        gX_smooth = gX_smooth * GYRO_SMOOTHING + gX * (1 - GYRO_SMOOTHING)
+                        gY_smooth = gY_smooth * GYRO_SMOOTHING + gY * (1 - GYRO_SMOOTHING)
+                        gZ_smooth = gZ_smooth * GYRO_SMOOTHING + gZ * (1 - GYRO_SMOOTHING)
+
+                        # Map gyro to direction (tilt-based)
+                        # Use gY for left/right, gX for up/down
+                        if abs(gY_smooth) > GYRO_DEADZONE * 2:  # Prioritize horizontal tilt
+                            dx = 1 if gY_smooth > 0 else -1
+                            dy = 0
+                        elif abs(gX_smooth) > GYRO_DEADZONE * 2:  # Vertical tilt
+                            dy = 1 if gX_smooth > 0 else -1
+                            dx = 0
+
+                        return (dx, dy)
+            except (ValueError, UnicodeDecodeError) as e:
+                print(f"MPU serial error: {e}")
+        return direction  # Fallback
+
+    return (dx, dy)
 
 # Menu screen
 def show_menu():
@@ -163,7 +244,8 @@ def show_menu():
     if background_image:
         screen.blit(background_image, (0, 0))
     draw_text("Super Noah-Snake-Game", title_font, TITLE_COLOR, screen, WIDTH // 2, HEIGHT // 4, center=True)
-    draw_text("Use joystick (or arrows) to move", small_font, TEXT_COLOR, screen, WIDTH // 2, HEIGHT // 2 - 50, center=True)
+    draw_text("Use joystick (or arrows) to move", small_font, TEXT_COLOR, screen, WIDTH // 2, HEIGHT // 2 - 100, center=True)
+    draw_text("Or toggle MPU6050 control with 'M' key", small_font, TEXT_COLOR, screen, WIDTH // 2, HEIGHT // 2 - 50, center=True)
     draw_text("Eat golden orbs to grow! Avoid edges and self.", small_font, TEXT_COLOR, screen, WIDTH // 2, HEIGHT // 2, center=True)
     draw_text("Power-ups: Blue orbs for speed boost!", small_font, TEXT_COLOR, screen, WIDTH // 2, HEIGHT // 2 + 50, center=True)
     draw_text("Press SPACE to start", font, FOOD_COLOR, screen, WIDTH // 2, HEIGHT // 2 + 150, center=True)
@@ -189,8 +271,10 @@ while True:
 
     for event in pygame.event.get():
         if event.type == pygame.QUIT:
-            if ser:
-                ser.close()
+            if ser_joystick:
+                ser_joystick.close()
+            if ser_mpu:
+                ser_mpu.close()
             save_high_score(score)
             pygame.quit()
             sys.exit()
@@ -201,6 +285,8 @@ while True:
                 paused = not paused
             if event.key == pygame.K_f:
                 pygame.display.toggle_fullscreen()
+            if event.key == pygame.K_m:  # Toggle control mode
+                control_mode = 1 - control_mode  # Switch between 0 and 1
 
     if paused:
         draw_text("Paused", title_font, TEXT_COLOR, screen, WIDTH // 2, HEIGHT // 2, center=True)
@@ -223,12 +309,14 @@ while True:
                 new_head[1] < 0 or new_head[1] >= HEIGHT):
                 game_over = True
                 if game_over_sound:
+                    print("Playing collision_sound.wav for game over")
                     game_over_sound.play()
 
             # Self or obstacle collision (unless powerup active)
             if not powerup_active and (new_head in snake or new_head in obstacles):
                 game_over = True
                 if game_over_sound:
+                    print("Playing collision_sound.wav for game over")
                     game_over_sound.play()
 
             snake.insert(0, new_head)
@@ -238,6 +326,7 @@ while True:
                 score += 1
                 save_high_score(score)
                 if eat_sound:
+                    print("Playing collect_sound.wav for eat")
                     eat_sound.play()
                 # Particles for effect
                 food_center = (food_pos[0] + CELL_SIZE // 2, food_pos[1] + CELL_SIZE // 2)
@@ -245,10 +334,11 @@ while True:
                     particles.append([[food_center[0], food_center[1]], [random.randint(-5, 5), random.randint(-5, 5)], random.randint(10, 20)])
                 if food_type == 'power':
                     powerup_active = True
-                    powerup_timer = 105  # ~15 seconds at 7 FPS
+                    powerup_timer = 60  # ~15 seconds at 4 FPS
                     if powerup_sound:
+                        print("Playing collect_sound.wav for power-up")
                         powerup_sound.play()
-                    FPS = 10  # Further reduced speed boost
+                    FPS = 6  # Slow power-up speed
                 else:
                     # Grow (don't pop tail)
                     pass
@@ -261,17 +351,20 @@ while True:
             # Level progression
             if score // 10 + 1 > level:
                 level = score // 10 + 1
-                FPS += 0.5  # Reduced speed increment
+                FPS += 0.25  # Slower speed increment
                 # Add obstacles
                 for _ in range(level):
                     obstacles.append(random_food_position(snake, obstacles))  # Random walls
+                if levelup_sound:
+                    print("Playing collision_sound.wav for level-up")
+                    levelup_sound.play()
 
         # Power-up timer
         if powerup_active:
             powerup_timer -= 1
             if powerup_timer <= 0:
                 powerup_active = False
-                FPS = 7  # Reset to further reduced base speed
+                FPS = 4  # Reset to very slow base speed
 
     # Draw obstacles as rocks (gray circles)
     for obs in obstacles:
@@ -318,6 +411,7 @@ while True:
     draw_text(f"Score: {score} | High: {high_score} | Level: {level}", font, TEXT_COLOR, screen, 10, HEIGHT - 40)
     if powerup_active:
         draw_text("Power-Up Active!", small_font, POWERUP_COLOR, screen, WIDTH - 200, 10)
+    draw_text(f"Control: {'Joystick/Keys' if control_mode == 0 else 'MPU6050'}", small_font, TEXT_COLOR, screen, WIDTH - 200, HEIGHT - 40)
 
     if game_over:
         screen.fill((100, 0, 0, 100), special_flags=pygame.BLEND_RGBA_MULT)  # Red fade
@@ -335,7 +429,7 @@ while True:
             level = 1
             obstacles = []
             powerup_active = False
-            FPS = 7
+            FPS = 4
 
     pygame.display.flip()
     clock.tick(FPS)
